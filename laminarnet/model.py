@@ -130,101 +130,91 @@ class GeometricDriftField(nn.Module):
         self.rope = RotaryPositionEmbedding(self.d_head, base=rope_base)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm(x)
-        B, N, D = x.shape
+        # Disable AMP autocast: SSM scan ops are NOT safe under float16
+        # because cumulative exponential sums routinely exceed 65504.
+        # autocast also forces nn.Linear/Conv1d to fp16 even after .float() calls.
+        input_dtype = x.dtype
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            residual = x
+            x = self.norm(x)
+            B, N, D = x.shape
 
-        # 1. Context & Proj (causal conv)
-        x_conv = self.conv1d(x.transpose(1, 2))[..., :N].transpose(1, 2)
-        x_conv = F.silu(x_conv)
+            # 1. Context & Proj (causal conv) — now guaranteed float32
+            x_conv = self.conv1d(x.transpose(1, 2))[..., :N].transpose(1, 2)
+            x_conv = F.silu(x_conv)
 
-        fused = self.in_proj(x_conv)
-        dt_raw, v, gate = fused.chunk(3, dim=-1)
+            fused = self.in_proj(x_conv)
+            dt_raw, v, gate = fused.chunk(3, dim=-1)
 
-        # 2. Selective Parameters (Cast and keep in FP32)
-        dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=0.001, max=2.0)
-        gate = torch.sigmoid(gate.float())
-        
-        # Integrate gate into log_alpha logic for true parallel scan equivalency
-        # If gate is 0, we want to forget everything -> decay should be infinite (log_alpha = -inf)
-        # If gate is 1, normal decay -> log_alpha = -dt
-        # We use a smoothed log(gate) to prevent actual -inf which NaN's out gradients
-        log_gate = torch.log(gate.float() + 1e-6)
-        log_alpha = -dt.float() + log_gate
-
-        # 3. RoPE-based Positional Rotation
-        cos_f, sin_f = self.rope(N, device=x.device, dtype=x.dtype)
-        v_view = v.view(B, N, self.n_heads, self.d_head)
-        v_rotated = apply_rope(v_view, cos_f, sin_f).reshape(B, N, D)
-
-        # 4. O(N) Vectorized Parallel Scan — adaptive chunk_size
-        chunk_size = min(256, N)
-        v_in = v_rotated * dt
-
-        # Pad to nearest chunk multiple
-        orig_N = N
-        remainder = N % chunk_size
-        if remainder != 0:
-            pad_len = chunk_size - remainder
-            v_in = F.pad(v_in, (0, 0, 0, pad_len))
-            # Pad log_alpha with 0 (which means exp(0) = 1, so perfectly preserve carry)
-            log_alpha = F.pad(log_alpha, (0, 0, 0, pad_len))
-
-        N_padded = v_in.shape[1]
-        num_chunks = N_padded // chunk_size
-
-        v_chunks = v_in.view(B, num_chunks, chunk_size, D)
-        la_chunks = log_alpha.view(B, num_chunks, chunk_size, D)
-
-        # Cumulative log-decay within each chunk
-        L_chunks = torch.cumsum(la_chunks.double(), dim=2)  # (B, C, T, D) fp64
-
-        # O(N) intra-chunk scan via cumsum (fp64 for exact precision + stability locally)
-        L_max = L_chunks.max(dim=2, keepdim=True).values
-        L_stable = L_chunks - L_max
-        exp_neg_L_stable = torch.exp(-L_stable)
-        scaled_v = exp_neg_L_stable * v_chunks.double()
-        cum_scaled = torch.cumsum(scaled_v, dim=2)
-        exp_L_stable = torch.exp(L_stable)
-        
-        # Keep chunk_out in float32 to prevent FP16 upper bound (65500) overflows during AMP
-        chunk_out = (exp_L_stable * cum_scaled).float()
-        L_chunks = L_chunks.float()
-
-        # 5. Inter-chunk carry handling via fast sequential loop over chunks
-        # Because num_chunks is very small (e.g. N/256), a python loop is basically free 
-        # while perfectly preserving chronological exactness and avoiding fp64 overflows.
-        if num_chunks > 1:
-            chunk_boundary_decay = L_chunks[:, :, -1, :]   # (B, C, D) float32
+            # 2. Selective Parameters
+            dt = F.softplus(dt_raw + self.dt_bias).clamp(min=0.001, max=2.0)
+            gate = torch.sigmoid(gate)
             
-            carries = []
-            # explicitly float32 carry buffer
-            current_carry = torch.zeros(B, D, device=x.device, dtype=torch.float32)
-            
-            for c in range(num_chunks):
-                carries.append(current_carry)
-                decay_c = torch.exp(chunk_boundary_decay[:, c, :])
-                current_carry = chunk_out[:, c, -1, :] + current_carry * decay_c
-                
-            carries = torch.stack(carries, dim=1)  # (B, C, D)
-            
-            final_out = chunk_out + carries.unsqueeze(2) * torch.exp(L_chunks)
-        else:
-            final_out = chunk_out
+            # Integrate gate into log_alpha logic for true parallel scan equivalency
+            log_gate = torch.log(gate + 1e-6)
+            log_alpha = -dt + log_gate
 
-        # Finally cast back to native precision, strictly clamping to avoid FP16 Infinity!
-        final_out = final_out.clamp(min=-6e4, max=6e4)
-        final_out = final_out.to(x.dtype).view(B, -1, D)[:, :orig_N, :]
+            # 3. RoPE-based Positional Rotation
+            cos_f, sin_f = self.rope(N, device=x.device, dtype=torch.float32)
+            v_view = v.view(B, N, self.n_heads, self.d_head)
+            v_rotated = apply_rope(v_view, cos_f, sin_f).reshape(B, N, D)
 
-        # Talking Heads Mixing
-        v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
-        # Apply head_mix (n_heads, n_heads) over axis 2
-        v_mix = torch.einsum('bnhd,hm->bnmd', v_mix, self.head_mix)
-        final_out = v_mix.reshape(B, orig_N, D)
+            # 4. O(N) Vectorized Parallel Scan — adaptive chunk_size
+            chunk_size = min(256, N)
+            v_in = v_rotated * dt
 
-        # 6. Output
-        out = self.out_proj(final_out)
-        return residual + self.dropout(out)
+            # Pad to nearest chunk multiple
+            orig_N = N
+            remainder = N % chunk_size
+            if remainder != 0:
+                pad_len = chunk_size - remainder
+                v_in = F.pad(v_in, (0, 0, 0, pad_len))
+                log_alpha = F.pad(log_alpha, (0, 0, 0, pad_len))
+
+            N_padded = v_in.shape[1]
+            num_chunks = N_padded // chunk_size
+
+            v_chunks = v_in.view(B, num_chunks, chunk_size, D)
+            la_chunks = log_alpha.view(B, num_chunks, chunk_size, D)
+
+            # Cumulative log-decay within each chunk
+            L_chunks = torch.cumsum(la_chunks.double(), dim=2)  # (B, C, T, D) fp64
+
+            # O(N) intra-chunk scan via cumsum (fp64 for exact precision)
+            L_max = L_chunks.max(dim=2, keepdim=True).values
+            L_stable = L_chunks - L_max
+            exp_neg_L_stable = torch.exp(-L_stable)
+            scaled_v = exp_neg_L_stable * v_chunks.double()
+            cum_scaled = torch.cumsum(scaled_v, dim=2)
+            exp_L_stable = torch.exp(L_stable)
+            chunk_out = (exp_L_stable * cum_scaled).float()
+            L_chunks = L_chunks.float()
+
+            # 5. Inter-chunk carry handling
+            if num_chunks > 1:
+                chunk_boundary_decay = L_chunks[:, :, -1, :]
+                carries = []
+                current_carry = torch.zeros(B, D, device=x.device, dtype=torch.float32)
+                for c in range(num_chunks):
+                    carries.append(current_carry)
+                    decay_c = torch.exp(chunk_boundary_decay[:, c, :])
+                    current_carry = chunk_out[:, c, -1, :] + current_carry * decay_c
+                carries = torch.stack(carries, dim=1)
+                final_out = chunk_out + carries.unsqueeze(2) * torch.exp(L_chunks)
+            else:
+                final_out = chunk_out
+
+            final_out = final_out.view(B, -1, D)[:, :orig_N, :]
+
+            # Talking Heads Mixing
+            v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
+            v_mix = torch.einsum('bnhd,hm->bnmd', v_mix, self.head_mix)
+            final_out = v_mix.reshape(B, orig_N, D)
+
+            # 6. Output
+            out = self.out_proj(final_out)
+            return (residual + self.dropout(out)).to(input_dtype)
 
     # ── Recurrent single-token step ──────────────────────────
     def step(self, x: torch.Tensor, state: dict) -> tuple:
@@ -313,20 +303,25 @@ class CrossStratumRouting(nn.Module):
         self.gate_c2f = nn.Sequential(nn.Linear(d_model, d_model), nn.Sigmoid())
 
     def forward(self, h_fine: torch.Tensor, h_coarse: torch.Tensor):
-        fine_t = h_fine.transpose(1, 2)
-        k = self.down.kernel_size if isinstance(self.down.kernel_size, int) else self.down.kernel_size[0]
-        fine_t = F.pad(fine_t, (k - 1, 0))
-        f_to_c = self.down(fine_t).transpose(1, 2)
-        Lc = h_coarse.shape[1]
-        if f_to_c.shape[1] < Lc:
-            f_to_c = F.pad(f_to_c, (0, 0, 0, Lc - f_to_c.shape[1]))
-        h_coarse = h_coarse + self.gate_f2c(f_to_c[:, :Lc, :]) * f_to_c[:, :Lc, :]
-        c_to_f = self.up(h_coarse.transpose(1, 2)).transpose(1, 2)
-        Lf = h_fine.shape[1]
-        if c_to_f.shape[1] < Lf:
-            c_to_f = F.pad(c_to_f, (0, 0, 0, Lf - c_to_f.shape[1]))
-        h_fine = h_fine + self.gate_c2f(c_to_f[:, :Lf, :]) * c_to_f[:, :Lf, :]
-        return h_fine, h_coarse
+        # Disable AMP autocast: gate linear layers must stay in float32
+        input_dtype = h_fine.dtype
+        with torch.amp.autocast(device_type=h_fine.device.type, enabled=False):
+            h_fine = h_fine.float()
+            h_coarse = h_coarse.float()
+            fine_t = h_fine.transpose(1, 2)
+            k = self.down.kernel_size if isinstance(self.down.kernel_size, int) else self.down.kernel_size[0]
+            fine_t = F.pad(fine_t, (k - 1, 0))
+            f_to_c = self.down(fine_t).transpose(1, 2)
+            Lc = h_coarse.shape[1]
+            if f_to_c.shape[1] < Lc:
+                f_to_c = F.pad(f_to_c, (0, 0, 0, Lc - f_to_c.shape[1]))
+            h_coarse = h_coarse + self.gate_f2c(f_to_c[:, :Lc, :]) * f_to_c[:, :Lc, :]
+            c_to_f = self.up(h_coarse.transpose(1, 2)).transpose(1, 2)
+            Lf = h_fine.shape[1]
+            if c_to_f.shape[1] < Lf:
+                c_to_f = F.pad(c_to_f, (0, 0, 0, Lf - c_to_f.shape[1]))
+            h_fine = h_fine + self.gate_c2f(c_to_f[:, :Lf, :]) * c_to_f[:, :Lf, :]
+            return h_fine.to(input_dtype), h_coarse.to(input_dtype)
 
     def step(self, h_f_step: torch.Tensor, h_c_step: torch.Tensor, state: dict):
         """
@@ -374,9 +369,13 @@ class SwiGLUFFN(nn.Module):
         self.w1, self.w2, self.w3 = nn.Linear(d_model, d_ff, bias=False), nn.Linear(d_ff, d_model, bias=False), nn.Linear(d_model, d_ff, bias=False)
         self.dropout = nn.Dropout(dropout)
     def forward(self, x):
-        res = x
-        x = self.norm(x)
-        return res + self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        # Disable AMP autocast: SwiGLU gating can overflow fp16
+        input_dtype = x.dtype
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            res = x
+            x = self.norm(x)
+            return (res + self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))).to(input_dtype)
 
 class LaminarNet(nn.Module):
     def __init__(self, config: LaminarNetConfig):

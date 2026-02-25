@@ -31,7 +31,7 @@ try:
     from laminarnet import LaminarNet, LaminarNetConfig
 except ImportError:
     print("LaminarNet package not found. Installing...")
-    os.system("pip install laminarnet==0.6.7")
+    os.system("pip install laminarnet==0.6.8")
     from laminarnet import LaminarNet, LaminarNetConfig
 
 # -----------------------------------------------------------------------------
