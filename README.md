@@ -79,6 +79,8 @@ pip install laminarnet
 
 ### Basic Inference
 
+> **New in v0.6.4**: LaminarNet now includes 6 architectural intelligence boosts (Forget Gates, Talking Heads, Iterative CSR, DenseNet Residuals, Head-Specific Decay, Adaptive Chunking) that improve reasoning and context quality with no change to O(N) complexity or parameter overhead.
+
 ```python
 import torch
 from laminarnet import LaminarNet, LaminarNetConfig

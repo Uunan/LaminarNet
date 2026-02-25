@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="laminarnet",
-    version="0.6.3",
+    version="0.6.4",
     author="Unan",
     description="A novel neural architecture merging SSM, RNN, and Hierarchical processing.",
     long_description=open("README.md", encoding="utf-8").read(),

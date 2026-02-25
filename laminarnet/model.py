@@ -1,6 +1,6 @@
 """
-LaminarNet v0.6.3 — RoPE, Dual-Gate CSR, Parallel Carry, Strata Validation
-                    + Recurrent Inference (step / init_state)
+LaminarNet v0.6.4 — Architectural Intelligence Boost
+                    Forget Gate, Talking Heads, Iterative CSR, DenseNet Residuals
 Faster than Transformer: larger chunks, streamlined architecture, vectorized carry.
 All temporal operations are strictly causal — no future information leakage.
 Recurrent inference: token-by-token generation via step() using the same trained weights.
@@ -110,10 +110,21 @@ class GeometricDriftField(nn.Module):
                                 padding=conv_kernel-1, groups=d_model)
 
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        # Talking Heads Mixing Matrix
+        self.head_mix = nn.Parameter(torch.eye(n_heads))
+        
         self.norm = RMSNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-        self.dt_bias = nn.Parameter(torch.ones(d_model) * -3.0)
+        # Head-specific dt_bias initialization (fast-decaying to slow-decaying)
+        dt = torch.exp(
+            torch.rand(n_heads, self.d_head) * (math.log(0.1) - math.log(10.0)) + math.log(10.0)
+        ).clamp(min=0.001)
+        # We store initial dt_bias as log(exp(dt) - 1) which is inverse softplus
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt.view(-1)) # D_model
+        
         self.rope = RotaryPositionEmbedding(self.d_head, base=rope_base)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -138,8 +149,8 @@ class GeometricDriftField(nn.Module):
         v_view = v.view(B, N, self.n_heads, self.d_head)
         v_rotated = apply_rope(v_view, cos_f, sin_f).reshape(B, N, D)
 
-        # 4. O(N) Vectorized Parallel Scan — chunk_size=256 for speed
-        chunk_size = 256
+        # 4. O(N) Vectorized Parallel Scan — adaptive chunk_size
+        chunk_size = min(256, N)
         v_in = v_rotated * dt
 
         # Pad to nearest chunk multiple
@@ -200,8 +211,17 @@ class GeometricDriftField(nn.Module):
 
         final_out = final_out[:, :orig_N, :]
 
+        # Forget Gate: conditionally reset carry based on current input context
+        final_out = final_out * gate
+
+        # Talking Heads Mixing
+        v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
+        # Apply head_mix (n_heads, n_heads) over axis 2
+        v_mix = torch.einsum('bnhd,hm->bnmd', v_mix, self.head_mix)
+        final_out = v_mix.reshape(B, orig_N, D)
+
         # 6. Output
-        out = self.out_proj(final_out * gate)
+        out = self.out_proj(final_out)
         return residual + self.dropout(out)
 
     # ── Recurrent single-token step ──────────────────────────
@@ -245,15 +265,23 @@ class GeometricDriftField(nn.Module):
         v_view = v.view(B, 1, self.n_heads, self.d_head)
         v_rotated = apply_rope(v_view, cos_f, sin_f).reshape(B, D)
 
-        # 5. Recurrent state update: carry = alpha * carry + dt * v
+        # 5. Recurrent state update: carry = gate * (alpha * carry + dt * v)
         carry = state["carry"]                                 # (B, D)
         dt_sq = dt.squeeze(1)                                  # (B, D)
-        new_carry = alpha * carry + dt_sq * v_rotated
+        
+        # Apply Forget Gate to carry formulation
+        gate_sq = gate.squeeze(1)                              # (B, D)
+        new_carry = gate_sq * (alpha * carry + dt_sq * v_rotated)
 
-        # 6. Output
-        out = self.out_proj((new_carry.unsqueeze(1)) * gate)
+        # Talking Heads Mixing on new_carry
+        c_mix = new_carry.view(B, self.n_heads, self.d_head)
+        c_mix = torch.einsum('bhd,hm->bmd', c_mix, self.head_mix)
+        c_mixed = c_mix.reshape(B, D)
+
+        # 6. Output (gate already applied to carry, just project mixed carry)
+        out = self.out_proj(c_mixed.unsqueeze(1))
         new_state = {
-            "carry": new_carry,
+            "carry": new_carry,  # store original newly gated carry, not the mixed one
             "conv_buf": new_conv_buf,
             "pos": pos + 1,
         }
@@ -320,11 +348,18 @@ class LaminarNet(nn.Module):
         coarse_strata = []
         for pool in self.strata_init:
             x_t = x.transpose(1, 2)
-            k = pool.kernel_size[0]
+            k = pool.kernel_size[0] if isinstance(pool.kernel_size, tuple) else pool.kernel_size
             x_t = F.pad(x_t, (k - 1, 0))
             coarse_strata.append(pool(x_t).transpose(1, 2))
         strata = [x] + coarse_strata
-        for b in self.blocks: strata = b(strata)
+        
+        # DenseNet-style cross-block residual accumulator for fine stratum
+        fine_accumulator = 0
+        for b in self.blocks:
+            strata[0] = strata[0] + fine_accumulator
+            strata = b(strata)
+            fine_accumulator = fine_accumulator + strata[0]
+            
         return self.head(self.norm_out(strata[0]))
 
     def count_parameters(self): return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -367,8 +402,12 @@ class LaminarNet(nn.Module):
         strata = [x] + [x.clone() for _ in range(self.config.n_strata - 1)]
 
         new_state = []
+        # DenseNet-style cross-block residual accumulator for fine stratum
+        fine_accumulator = 0
         for i, block in enumerate(self.blocks):
+            strata[0] = strata[0] + fine_accumulator
             strata, bs = block.step(strata, state[i])
+            fine_accumulator = fine_accumulator + strata[0]
             new_state.append(bs)
 
         logits = self.head(self.norm_out(strata[0]))   # (B, 1, V)
@@ -383,7 +422,12 @@ class LaminarBlock(nn.Module):
         self.ffns = nn.ModuleList([SwiGLUFFN(config.d_model, config.d_ff, config.dropout) for _ in range(self.S)])
     def forward(self, strata):
         for s in range(self.S): strata[s] = self.gdfs[s](strata[s])
-        for s in range(self.S - 1): strata[s], strata[s+1] = self.csrs[s](strata[s], strata[s+1])
+        
+        # Iterative CSR (2 passes)
+        for _ in range(2):
+            for s in range(self.S - 1): 
+                strata[s], strata[s+1] = self.csrs[s](strata[s], strata[s+1])
+                
         for s in range(self.S): strata[s] = self.ffns[s](strata[s])
         return strata
 
@@ -393,8 +437,12 @@ class LaminarBlock(nn.Module):
         for s in range(self.S):
             strata[s], new_s = self.gdfs[s].step(strata[s], block_state[s])
             new_block_state.append(new_s)
-        for s in range(self.S - 1):
-            strata[s], strata[s+1] = self.csrs[s](strata[s], strata[s+1])
+            
+        # Iterative CSR (2 passes)
+        for _ in range(2):
+            for s in range(self.S - 1):
+                strata[s], strata[s+1] = self.csrs[s](strata[s], strata[s+1])
+                
         for s in range(self.S):
             strata[s] = self.ffns[s](strata[s])
         return strata, new_block_state
