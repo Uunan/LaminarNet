@@ -145,9 +145,8 @@ class GeometricDriftField(nn.Module):
         dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=0.001, max=2.0).to(dt_raw.dtype)
         gate = torch.sigmoid(gate)
         
-        # Integrate gate into log_alpha for true parallel scan equivalency
-        log_gate = torch.log(gate.float() + 1e-6)
-        log_alpha = -dt.float() + log_gate
+        # In v0.6.3, gate is strictly an output gate, not a forget gate.
+        log_alpha = -dt.float()
 
         # 3. RoPE-based Positional Rotation
         cos_f, sin_f = self.rope(N, device=x.device, dtype=x.dtype)
@@ -215,9 +214,9 @@ class GeometricDriftField(nn.Module):
         v_mix = torch.einsum('bnhd,hm->bnmd', v_mix, self.head_mix)
         final_out = v_mix.reshape(B, orig_N, D)
 
-        # 6. Output — Clamp residual to protect fp16 main stream
-        out = self.out_proj(final_out)
-        return (residual + self.dropout(out)).clamp(min=-6e4, max=6e4)
+        # 6. Output — Restore v0.6.3 Gating
+        out = self.out_proj(final_out * gate)
+        return residual + self.dropout(out)
 
     # ── Recurrent single-token step ──────────────────────────
     def step(self, x: torch.Tensor, state: dict) -> tuple:
@@ -263,14 +262,13 @@ class GeometricDriftField(nn.Module):
         # 5. Recurrent state update: carry = gate * (alpha * carry) + dt * v
         # Note: In parallel scan, dt is NOT multiplied by gate, but the incoming carry IS.
         # So we gate the old carry, but add the new v_rotated normally.
-        # Strict FP32 for the continuous time recurrent state 
         carry = state["carry"].float()                                 # (B, D)
         dt_sq = dt.squeeze(1).float()                                  # (B, D)
-        gate_sq = gate.squeeze(1).float()                              # (B, D)
+        gate_sq = gate.squeeze(1)                                      # (B, D)
         v_rotated = v_rotated.float()
         
-        # Consistent forget gate application
-        new_carry = gate_sq * alpha * carry + dt_sq * v_rotated
+        # Strict v0.6.3 recurrence: no forget gate on carry, only output gate
+        new_carry = alpha * carry + dt_sq * v_rotated
         
         # Explicit bounds check to prevent FP16 INF cast
         new_carry = new_carry.clamp(min=-6e4, max=6e4)
@@ -280,9 +278,9 @@ class GeometricDriftField(nn.Module):
         c_mix = torch.einsum('bhd,hm->bmd', c_mix, self.head_mix.to(x.dtype))
         c_mixed = c_mix.reshape(B, D)
 
-        # 6. Output (gate already applied to carry, just project mixed carry)
-        out = self.out_proj(c_mixed.unsqueeze(1))
-        ret_out = (residual + self.dropout(out)).clamp(min=-6e4, max=6e4)
+        # 6. Output
+        out = self.out_proj(c_mixed.unsqueeze(1) * gate)
+        ret_out = residual + self.dropout(out)
         new_state = {
             "carry": new_carry,  # store original newly gated carry, not the mixed one
             "conv_buf": new_conv_buf,
@@ -313,12 +311,12 @@ class CrossStratumRouting(nn.Module):
         Lc = h_coarse.shape[1]
         if f_to_c.shape[1] < Lc:
             f_to_c = F.pad(f_to_c, (0, 0, 0, Lc - f_to_c.shape[1]))
-        h_coarse = (h_coarse + self.gate_f2c(f_to_c[:, :Lc, :]) * f_to_c[:, :Lc, :]).clamp(min=-6e4, max=6e4)
+        h_coarse = h_coarse + self.gate_f2c(f_to_c[:, :Lc, :]) * f_to_c[:, :Lc, :]
         c_to_f = self.up(h_coarse.transpose(1, 2)).transpose(1, 2)
         Lf = h_fine.shape[1]
         if c_to_f.shape[1] < Lf:
             c_to_f = F.pad(c_to_f, (0, 0, 0, Lf - c_to_f.shape[1]))
-        h_fine = (h_fine + self.gate_c2f(c_to_f[:, :Lf, :]) * c_to_f[:, :Lf, :]).clamp(min=-6e4, max=6e4)
+        h_fine = h_fine + self.gate_c2f(c_to_f[:, :Lf, :]) * c_to_f[:, :Lf, :]
         return h_fine, h_coarse
 
     def step(self, h_f_step: torch.Tensor, h_c_step: torch.Tensor, state: dict):
@@ -369,9 +367,9 @@ class SwiGLUFFN(nn.Module):
     def forward(self, x):
         res = x
         x = self.norm(x)
-        # Protect SwiGLU multiplication from exceeding float16 limit
+        # Protect SwiGLU multiplication from internal float16 overflow, but don't clamp the residual output
         gate_val = (F.silu(self.w1(x)) * self.w3(x)).clamp(min=-6e4, max=6e4)
-        return (res + self.dropout(self.w2(gate_val))).clamp(min=-6e4, max=6e4)
+        return res + self.dropout(self.w2(gate_val))
 
 class LaminarNet(nn.Module):
     def __init__(self, config: LaminarNetConfig):
@@ -398,13 +396,8 @@ class LaminarNet(nn.Module):
             coarse_strata.append(pool(x_t).transpose(1, 2))
         strata = [x] + coarse_strata
         
-        # DenseNet-style cross-block residual accumulator for fine stratum
-        # Must strictly remain in float32 and be clamped to prevent fp16 overflow across blocks.
-        fine_accumulator = 0.0
         for b in self.blocks:
-            strata[0] = strata[0] + fine_accumulator * 0.5
             strata = b(strata)
-            fine_accumulator = (fine_accumulator + strata[0].float()).clamp(min=-6e4, max=6e4)
             
         # The final head projection is a 320 -> 50257 matmul. In float16, this almost
         # always overflows the 65504 limit if not protected.
