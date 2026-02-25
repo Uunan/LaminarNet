@@ -215,9 +215,9 @@ class GeometricDriftField(nn.Module):
         v_mix = torch.einsum('bnhd,hm->bnmd', v_mix, self.head_mix)
         final_out = v_mix.reshape(B, orig_N, D)
 
-        # 6. Output
+        # 6. Output — Clamp residual to protect fp16 main stream
         out = self.out_proj(final_out)
-        return residual + self.dropout(out)
+        return (residual + self.dropout(out)).clamp(min=-6e4, max=6e4)
 
     # ── Recurrent single-token step ──────────────────────────
     def step(self, x: torch.Tensor, state: dict) -> tuple:
@@ -282,7 +282,7 @@ class GeometricDriftField(nn.Module):
 
         # 6. Output (gate already applied to carry, just project mixed carry)
         out = self.out_proj(c_mixed.unsqueeze(1))
-        ret_out = residual + self.dropout(out)
+        ret_out = (residual + self.dropout(out)).clamp(min=-6e4, max=6e4)
         new_state = {
             "carry": new_carry,  # store original newly gated carry, not the mixed one
             "conv_buf": new_conv_buf,
@@ -313,12 +313,12 @@ class CrossStratumRouting(nn.Module):
         Lc = h_coarse.shape[1]
         if f_to_c.shape[1] < Lc:
             f_to_c = F.pad(f_to_c, (0, 0, 0, Lc - f_to_c.shape[1]))
-        h_coarse = h_coarse + self.gate_f2c(f_to_c[:, :Lc, :]) * f_to_c[:, :Lc, :]
+        h_coarse = (h_coarse + self.gate_f2c(f_to_c[:, :Lc, :]) * f_to_c[:, :Lc, :]).clamp(min=-6e4, max=6e4)
         c_to_f = self.up(h_coarse.transpose(1, 2)).transpose(1, 2)
         Lf = h_fine.shape[1]
         if c_to_f.shape[1] < Lf:
             c_to_f = F.pad(c_to_f, (0, 0, 0, Lf - c_to_f.shape[1]))
-        h_fine = h_fine + self.gate_c2f(c_to_f[:, :Lf, :]) * c_to_f[:, :Lf, :]
+        h_fine = (h_fine + self.gate_c2f(c_to_f[:, :Lf, :]) * c_to_f[:, :Lf, :]).clamp(min=-6e4, max=6e4)
         return h_fine, h_coarse
 
     def step(self, h_f_step: torch.Tensor, h_c_step: torch.Tensor, state: dict):
@@ -371,7 +371,7 @@ class SwiGLUFFN(nn.Module):
         x = self.norm(x)
         # Protect SwiGLU multiplication from exceeding float16 limit
         gate_val = (F.silu(self.w1(x)) * self.w3(x)).clamp(min=-6e4, max=6e4)
-        return res + self.dropout(self.w2(gate_val))
+        return (res + self.dropout(self.w2(gate_val))).clamp(min=-6e4, max=6e4)
 
 class LaminarNet(nn.Module):
     def __init__(self, config: LaminarNetConfig):
