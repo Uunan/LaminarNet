@@ -184,17 +184,20 @@ class GeometricDriftField(nn.Module):
         scaled_v = exp_neg_L_stable * v_chunks.double()
         cum_scaled = torch.cumsum(scaled_v, dim=2)
         exp_L_stable = torch.exp(L_stable)
-        chunk_out = (exp_L_stable * cum_scaled).to(x.dtype)
+        
+        # Keep chunk_out in float32 to prevent FP16 upper bound (65500) overflows during AMP
+        chunk_out = (exp_L_stable * cum_scaled).float()
         L_chunks = L_chunks.float()
 
         # 5. Inter-chunk carry handling via fast sequential loop over chunks
         # Because num_chunks is very small (e.g. N/256), a python loop is basically free 
         # while perfectly preserving chronological exactness and avoiding fp64 overflows.
         if num_chunks > 1:
-            chunk_boundary_decay = L_chunks[:, :, -1, :]   # (B, C, D)
+            chunk_boundary_decay = L_chunks[:, :, -1, :]   # (B, C, D) float32
             
             carries = []
-            current_carry = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+            # explicitly float32 carry buffer
+            current_carry = torch.zeros(B, D, device=x.device, dtype=torch.float32)
             
             for c in range(num_chunks):
                 carries.append(current_carry)
@@ -207,7 +210,8 @@ class GeometricDriftField(nn.Module):
         else:
             final_out = chunk_out
 
-        final_out = final_out.view(B, -1, D)[:, :orig_N, :]
+        # Finally cast back to native precision
+        final_out = final_out.to(x.dtype).view(B, -1, D)[:, :orig_N, :]
 
         # Talking Heads Mixing
         v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
@@ -248,9 +252,9 @@ class GeometricDriftField(nn.Module):
         dt_raw, v, gate = fused.chunk(3, dim=-1)
 
         # 3. Selective parameters
-        dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=0.001, max=2.0).to(dt_raw.dtype)
-        gate = torch.sigmoid(gate)
-        alpha = torch.exp(-dt.squeeze(1))                      # (B, D)
+        dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=0.001, max=2.0)
+        gate = torch.sigmoid(gate.float())
+        alpha = torch.exp(-dt.squeeze(1))                      # (B, D) float32
 
         # 4. RoPE at current position
         pos = state["pos"]
@@ -263,16 +267,21 @@ class GeometricDriftField(nn.Module):
         # 5. Recurrent state update: carry = gate * (alpha * carry) + dt * v
         # Note: In parallel scan, dt is NOT multiplied by gate, but the incoming carry IS.
         # So we gate the old carry, but add the new v_rotated normally.
-        carry = state["carry"]                                 # (B, D)
-        dt_sq = dt.squeeze(1)                                  # (B, D)
-        gate_sq = gate.squeeze(1)                              # (B, D)
+        # Strict FP32 for the continuous time recurrent state 
+        carry = state["carry"].float()                                 # (B, D)
+        dt_sq = dt.squeeze(1).float()                                  # (B, D)
+        gate_sq = gate.squeeze(1).float()                              # (B, D)
+        v_rotated = v_rotated.float()
         
         # Consistent forget gate application
         new_carry = gate_sq * alpha * carry + dt_sq * v_rotated
+        
+        # Explicit bounds check to prevent FP16 INF cast
+        new_carry = new_carry.clamp(min=-6e4, max=6e4)
 
         # Talking Heads Mixing on new_carry
-        c_mix = new_carry.view(B, self.n_heads, self.d_head)
-        c_mix = torch.einsum('bhd,hm->bmd', c_mix, self.head_mix)
+        c_mix = new_carry.to(x.dtype).view(B, self.n_heads, self.d_head)
+        c_mix = torch.einsum('bhd,hm->bmd', c_mix, self.head_mix.to(x.dtype))
         c_mixed = c_mix.reshape(B, D)
 
         # 6. Output (gate already applied to carry, just project mixed carry)
