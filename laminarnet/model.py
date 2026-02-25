@@ -161,7 +161,10 @@ class GeometricDriftField(nn.Module):
             v_rotated = apply_rope(v_view, cos_f, sin_f).reshape(B, N, D)
 
             # 4. O(N) Vectorized Parallel Scan — adaptive chunk_size
-            chunk_size = min(256, N)
+            # chunk_size=128 to keep cumulative log-decay within float64 range.
+            # With |log_alpha| up to ~3.0 per step, 128 steps → exp(384) = 1e166,
+            # safely within float64 max of 1.8e308. (256 would reach exp(700+).)
+            chunk_size = min(128, N)
             v_in = v_rotated * dt
 
             # Pad to nearest chunk multiple
@@ -188,14 +191,17 @@ class GeometricDriftField(nn.Module):
             scaled_v = exp_neg_L_stable * v_chunks.double()
             cum_scaled = torch.cumsum(scaled_v, dim=2)
             exp_L_stable = torch.exp(L_stable)
-            chunk_out = (exp_L_stable * cum_scaled).float()
-            L_chunks = L_chunks.float()
+            # CRITICAL: Keep chunk_out in float64! Values can reach 1e307 which
+            # is valid in float64 but overflows to Inf in float32 (max 3.4e38).
+            # The large exponentials cancel out in final_out, so we only convert
+            # to float32 AFTER the cancellation.
+            chunk_out = exp_L_stable * cum_scaled  # stays float64
 
-            # 5. Inter-chunk carry handling
+            # 5. Inter-chunk carry handling (all in float64)
             if num_chunks > 1:
-                chunk_boundary_decay = L_chunks[:, :, -1, :]
+                chunk_boundary_decay = L_chunks[:, :, -1, :]  # float64
                 carries = []
-                current_carry = torch.zeros(B, D, device=x.device, dtype=torch.float32)
+                current_carry = torch.zeros(B, D, device=x.device, dtype=torch.float64)
                 for c in range(num_chunks):
                     carries.append(current_carry)
                     decay_c = torch.exp(chunk_boundary_decay[:, c, :])
@@ -205,7 +211,8 @@ class GeometricDriftField(nn.Module):
             else:
                 final_out = chunk_out
 
-            final_out = final_out.view(B, -1, D)[:, :orig_N, :]
+            # NOW convert to float32 — after exponentials have cancelled
+            final_out = final_out.float().view(B, -1, D)[:, :orig_N, :]
 
             # Talking Heads Mixing
             v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
