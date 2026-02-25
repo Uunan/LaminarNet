@@ -1,5 +1,5 @@
 """
-LaminarNet v0.6.4 — Architectural Intelligence Boost
+LaminarNet v0.6.5 — Recurrent Inference & Math Equality Update
                     Forget Gate, Talking Heads, Iterative CSR, DenseNet Residuals
 Faster than Transformer: larger chunks, streamlined architecture, vectorized carry.
 All temporal operations are strictly causal — no future information leakage.
@@ -142,7 +142,13 @@ class GeometricDriftField(nn.Module):
         # 2. Selective Parameters
         dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=0.001, max=2.0).to(dt_raw.dtype)
         gate = torch.sigmoid(gate)
-        log_alpha = -dt
+        
+        # Integrate gate into log_alpha logic for true parallel scan equivalency
+        # If gate is 0, we want to forget everything -> decay should be infinite (log_alpha = -inf)
+        # If gate is 1, normal decay -> log_alpha = -dt
+        # We use a smoothed log(gate) to prevent actual -inf which NaN's out gradients
+        log_gate = torch.log(gate.float() + 1e-6)
+        log_alpha = -dt.float() + log_gate
 
         # 3. RoPE-based Positional Rotation
         cos_f, sin_f = self.rope(N, device=x.device, dtype=x.dtype)
@@ -159,6 +165,7 @@ class GeometricDriftField(nn.Module):
         if remainder != 0:
             pad_len = chunk_size - remainder
             v_in = F.pad(v_in, (0, 0, 0, pad_len))
+            # Pad log_alpha with 0 (which means exp(0) = 1, so perfectly preserve carry)
             log_alpha = F.pad(log_alpha, (0, 0, 0, pad_len))
 
         N_padded = v_in.shape[1]
@@ -168,51 +175,43 @@ class GeometricDriftField(nn.Module):
         la_chunks = log_alpha.view(B, num_chunks, chunk_size, D)
 
         # Cumulative log-decay within each chunk
-        L_chunks = torch.cumsum(la_chunks, dim=2)  # (B, C, T, D)
-        L_chunks = L_chunks.float().clamp(min=-20.0, max=0.0)  # stabilize
+        L_chunks = torch.cumsum(la_chunks.double(), dim=2)  # (B, C, T, D) fp64
 
-        # O(N) intra-chunk scan via cumsum (float32 for precision + stability)
+        # O(N) intra-chunk scan via cumsum (fp64 for exact precision + stability locally)
         L_max = L_chunks.max(dim=2, keepdim=True).values
         L_stable = L_chunks - L_max
         exp_neg_L_stable = torch.exp(-L_stable)
-        scaled_v = exp_neg_L_stable * v_chunks.float()
+        scaled_v = exp_neg_L_stable * v_chunks.double()
         cum_scaled = torch.cumsum(scaled_v, dim=2)
         exp_L_stable = torch.exp(L_stable)
-        chunk_out = exp_L_stable * cum_scaled  # stay float32
+        chunk_out = (exp_L_stable * cum_scaled).to(x.dtype)
+        L_chunks = L_chunks.float()
 
-        # 5. Parallel inter-chunk carry (no Python for-loop) — all in float32
+        # 5. Inter-chunk carry handling via fast sequential loop over chunks
+        # Because num_chunks is very small (e.g. N/256), a python loop is basically free 
+        # while perfectly preserving chronological exactness and avoiding fp64 overflows.
         if num_chunks > 1:
-            chunk_boundary_decay = L_chunks[:, :, -1, :]   # (B, C, D) already float32
-            chunk_boundary_out = chunk_out[:, :, -1, :]     # (B, C, D) already float32
-
-            # Parallel prefix sum in log-space
-            cum_decay = torch.cumsum(chunk_boundary_decay, dim=1)  # (B, C, D)
-            cum_decay = cum_decay.clamp(min=-80.0, max=0.0)       # prevent extreme values
-
-            # Log-space stabilized parallel carry
-            stabilizer = cum_decay.max(dim=1, keepdim=True).values
-            norm_cum_decay = (cum_decay - stabilizer).clamp(min=-20.0, max=0.0)
-
-            seeds = chunk_boundary_out * torch.exp(-norm_cum_decay)
-
-            # Shift seeds right (carry[0] = 0, carry[c] uses chunks 0..c-1)
-            shifted_seeds = F.pad(seeds[:, :-1], (0, 0, 1, 0))
-            cum_seeds = torch.cumsum(shifted_seeds, dim=1)
-
-            carries = cum_seeds * torch.exp(norm_cum_decay)
-
-            # Apply all carries in parallel (L_chunks already clamped)
+            chunk_boundary_decay = L_chunks[:, :, -1, :]   # (B, C, D)
+            
+            carries = []
+            current_carry = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+            
+            for c in range(num_chunks):
+                carries.append(current_carry)
+                decay_c = torch.exp(chunk_boundary_decay[:, c, :])
+                current_carry = chunk_out[:, c, -1, :] + current_carry * decay_c
+                
+            carries = torch.stack(carries, dim=1)  # (B, C, D)
+            
             final_out = chunk_out + carries.unsqueeze(2) * torch.exp(L_chunks)
-            final_out = final_out.to(x.dtype)  # cast back after all float32 math
-            final_out = final_out.view(B, -1, D)
         else:
-            final_out = chunk_out.to(x.dtype)
-            final_out = final_out.view(B, -1, D)
+            final_out = chunk_out
+
+        final_out = final_out.view(B, -1, D)[:, :orig_N, :]
 
         final_out = final_out[:, :orig_N, :]
 
-        # Forget Gate: conditionally reset carry based on current input context
-        final_out = final_out * gate
+        final_out = final_out[:, :orig_N, :]
 
         # Talking Heads Mixing
         v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
@@ -265,13 +264,15 @@ class GeometricDriftField(nn.Module):
         v_view = v.view(B, 1, self.n_heads, self.d_head)
         v_rotated = apply_rope(v_view, cos_f, sin_f).reshape(B, D)
 
-        # 5. Recurrent state update: carry = gate * (alpha * carry + dt * v)
+        # 5. Recurrent state update: carry = gate * (alpha * carry) + dt * v
+        # Note: In parallel scan, dt is NOT multiplied by gate, but the incoming carry IS.
+        # So we gate the old carry, but add the new v_rotated normally.
         carry = state["carry"]                                 # (B, D)
         dt_sq = dt.squeeze(1)                                  # (B, D)
-        
-        # Apply Forget Gate to carry formulation
         gate_sq = gate.squeeze(1)                              # (B, D)
-        new_carry = gate_sq * (alpha * carry + dt_sq * v_rotated)
+        
+        # Consistent forget gate application
+        new_carry = gate_sq * alpha * carry + dt_sq * v_rotated
 
         # Talking Heads Mixing on new_carry
         c_mix = new_carry.view(B, self.n_heads, self.d_head)
@@ -280,12 +281,14 @@ class GeometricDriftField(nn.Module):
 
         # 6. Output (gate already applied to carry, just project mixed carry)
         out = self.out_proj(c_mixed.unsqueeze(1))
+        ret_out = residual + self.dropout(out)
         new_state = {
             "carry": new_carry,  # store original newly gated carry, not the mixed one
             "conv_buf": new_conv_buf,
             "pos": pos + 1,
+            "last_out": ret_out
         }
-        return residual + self.dropout(out), new_state
+        return ret_out, new_state
 
 
 # ─────────────────────────────────────────────────────────────
@@ -316,6 +319,45 @@ class CrossStratumRouting(nn.Module):
             c_to_f = F.pad(c_to_f, (0, 0, 0, Lf - c_to_f.shape[1]))
         h_fine = h_fine + self.gate_c2f(c_to_f[:, :Lf, :]) * c_to_f[:, :Lf, :]
         return h_fine, h_coarse
+
+    def step(self, h_f_step: torch.Tensor, h_c_step: torch.Tensor, state: dict):
+        """
+        Recurrent causal step for CrossStratumRouting.
+        h_f_step: (B, 1, D)
+        h_c_step: (B, 1, D) - only valid/used when (pos+1) % stride == 0
+        state: buf_f (B, stride-1, D), last_c (B, 1, D), pos (int)
+        """
+        buf_f = state["buf_f"]
+        last_c = state["last_c"]
+        pos = state["pos"]
+        
+        # We compute a new coarse token every `stride` steps
+        if pos % self.stride == 0:
+            window = torch.cat([buf_f, h_f_step], dim=1) # (B, stride, D)
+            f_to_c = window.mean(dim=1, keepdim=True)
+            
+            g_f2c = self.gate_f2c(f_to_c)
+            last_c = h_c_step + g_f2c * f_to_c
+            new_h_c_step = last_c
+        else:
+            new_h_c_step = last_c # return the appropriately updated coarse token from the last tick
+            
+        c_to_f = last_c
+        g_c2f = self.gate_c2f(c_to_f)
+        new_h_f_step = h_f_step + g_c2f * c_to_f
+        
+        # Rotate buffer
+        if self.stride > 1:
+            new_buf_f = torch.cat([buf_f[:, 1:], h_f_step], dim=1)
+        else:
+            new_buf_f = buf_f
+            
+        new_state = {
+            "buf_f": new_buf_f,
+            "last_c": last_c,
+            "pos": pos + 1
+        }
+        return new_h_f_step, new_h_c_step, new_state
 
 class SwiGLUFFN(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
@@ -354,9 +396,10 @@ class LaminarNet(nn.Module):
         strata = [x] + coarse_strata
         
         # DenseNet-style cross-block residual accumulator for fine stratum
+        # The scale down (0.5) helps prevent activation explosion in deep networks
         fine_accumulator = 0
         for b in self.blocks:
-            strata[0] = strata[0] + fine_accumulator
+            strata[0] = strata[0] + fine_accumulator * 0.5
             strata = b(strata)
             fine_accumulator = fine_accumulator + strata[0]
             
@@ -366,27 +409,62 @@ class LaminarNet(nn.Module):
 
     # ── Recurrent Inference API ──────────────────────────────
     def init_state(self, batch_size: int = 1,
-                   device: torch.device = torch.device("cpu")) -> list:
+                   device: torch.device = torch.device("cpu")) -> dict:
         """
         Create the initial recurrent state for step-by-step inference.
-        Returns a nested list:  state[block_idx][stratum_idx] = {carry, conv_buf, pos}
+        Returns a dict with global state and block states.
         """
         D = self.config.d_model
         K = self.config.conv_kernel
-        state = []
-        for _ in self.blocks:
+        
+        # Strata initialization buffers
+        strata_state = {
+            "pos": 0,
+            "bufs": [
+                torch.zeros(batch_size, pool.kernel_size[0] if isinstance(pool.kernel_size, tuple) else pool.kernel_size - 1, D, device=device) 
+                for pool in self.strata_init
+            ],
+            "last_c": [
+                torch.zeros(batch_size, 1, D, device=device)
+                for _ in self.strata_init
+            ]
+        }
+        
+        block_states = []
+        for i in range(self.config.n_layers):
             block_state = []
-            for _ in range(self.config.n_strata):
+            for s in range(self.config.n_strata):
                 block_state.append({
                     "carry": torch.zeros(batch_size, D, device=device),
                     "conv_buf": torch.zeros(batch_size, D, K - 1, device=device),
                     "pos": 0,
+                    "last_out": torch.zeros(batch_size, 1, D, device=device)
                 })
-            state.append(block_state)
-        return state
+                
+            routing_states = []
+            for pass_idx in range(2):
+                pass_state = []
+                for s in range(self.config.n_strata - 1):
+                    stride = self.config.strata_ratios[s+1] // self.config.strata_ratios[s]
+                    pass_state.append({
+                        "buf_f": torch.zeros(batch_size, stride - 1, D, device=device),
+                        "last_c": torch.zeros(batch_size, 1, D, device=device),
+                        "pos": 0,
+                    })
+                routing_states.append(pass_state)
+                
+            block_states.append({
+                "gdfs": block_state,
+                "csrs": routing_states
+            })
+        
+        return {
+            "strata_state": strata_state,
+            "block_states": block_states
+        }
 
     @torch.no_grad()
-    def step(self, token_id: torch.Tensor, state: list) -> tuple:
+    def step(self, token_id: torch.Tensor, state: dict) -> tuple:
         """
         Run a single token through the model recurrently.
         token_id: (B,) or (B, 1)
@@ -398,20 +476,51 @@ class LaminarNet(nn.Module):
 
         x = self.tok_emb(token_id)                     # (B, 1, D)
 
-        # Build strata: fine = x, coarse = same embedding for single token
-        strata = [x] + [x.clone() for _ in range(self.config.n_strata - 1)]
+        # Causal strata initialization step
+        strata = [x]
+        
+        s_state = state["strata_state"]
+        pos = s_state["pos"]
+        new_bufs = []
+        new_last_c = []
+        
+        for s, pool in enumerate(self.strata_init):
+            k = pool.kernel_size[0] if isinstance(pool.kernel_size, tuple) else pool.kernel_size
+            buf_f = s_state["bufs"][s]
+            last_c = s_state["last_c"][s]
+            
+            if pos % k == 0:
+                # Need 1 less element than kernel size from the buffer
+                window = torch.cat([buf_f[:, -(k-1):, :] if k > 1 else torch.empty(x.shape[0], 0, x.shape[2], device=x.device), x], dim=1)
+                new_c = window.mean(dim=1, keepdim=True)
+                last_c = new_c
+                
+            strata.append(last_c)
+            new_last_c.append(last_c)
+            
+            if k > 1:
+                new_buf_f = torch.cat([buf_f[:, 1:], x], dim=1)
+            else:
+                new_buf_f = buf_f
+            new_bufs.append(new_buf_f)
 
-        new_state = []
+        new_strata_state = {
+            "pos": pos + 1,
+            "bufs": new_bufs,
+            "last_c": new_last_c
+        }
+
+        new_block_states = []
         # DenseNet-style cross-block residual accumulator for fine stratum
         fine_accumulator = 0
         for i, block in enumerate(self.blocks):
-            strata[0] = strata[0] + fine_accumulator
-            strata, bs = block.step(strata, state[i])
+            strata[0] = strata[0] + fine_accumulator * 0.5
+            strata, bs = block.step(strata, state["block_states"][i], pos)
             fine_accumulator = fine_accumulator + strata[0]
-            new_state.append(bs)
+            new_block_states.append(bs)
 
         logits = self.head(self.norm_out(strata[0]))   # (B, 1, V)
-        return logits.squeeze(1), new_state            # (B, V)
+        return logits.squeeze(1), {"strata_state": new_strata_state, "block_states": new_block_states}
 
 class LaminarBlock(nn.Module):
     def __init__(self, config):
@@ -431,21 +540,42 @@ class LaminarBlock(nn.Module):
         for s in range(self.S): strata[s] = self.ffns[s](strata[s])
         return strata
 
-    def step(self, strata: list, block_state: list) -> tuple:
+    def step(self, strata: list, block_state: dict, pos: int) -> tuple:
         """Single-token step through block. Returns (strata, new_block_state)."""
-        new_block_state = []
+        new_gdf_state = []
+        
+        # Calculate cumulative strides for each stratum
+        # strata 0 has stride 1
+        # strata s has stride Product(strata_ratios[:s])
+        
         for s in range(self.S):
-            strata[s], new_s = self.gdfs[s].step(strata[s], block_state[s])
-            new_block_state.append(new_s)
+            if s == 0:
+                stride = 1
+            else:
+                stride = 1
+                for r in range(s):
+                    stride *= self.csrs[r].stride
+                    
+            if pos % stride == 0:
+                strata[s], new_s = self.gdfs[s].step(strata[s], block_state["gdfs"][s])
+            else:
+                new_s = block_state["gdfs"][s]
+                strata[s] = new_s["last_out"]
+            new_gdf_state.append(new_s)
             
+        new_csr_states = [[], []]
         # Iterative CSR (2 passes)
-        for _ in range(2):
+        for pass_idx in range(2):
             for s in range(self.S - 1):
-                strata[s], strata[s+1] = self.csrs[s](strata[s], strata[s+1])
+                strata[s], strata[s+1], updated_state = self.csrs[s].step(
+                    strata[s], strata[s+1], block_state["csrs"][pass_idx][s]
+                )
+                new_csr_states[pass_idx].append(updated_state)
                 
         for s in range(self.S):
             strata[s] = self.ffns[s](strata[s])
-        return strata, new_block_state
+            
+        return strata, {"gdfs": new_gdf_state, "csrs": new_csr_states}
 
 if __name__ == "__main__":
     conf = LaminarNetConfig()
