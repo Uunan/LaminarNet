@@ -21,7 +21,7 @@ torch.set_float32_matmul_precision('high')
 try:
     from laminarnet import LaminarNet, LaminarNetConfig
 except ImportError:
-    os.system("pip install laminarnet==0.6.3")
+    os.system("pip install laminarnet==0.6.5")
     from laminarnet import LaminarNet, LaminarNetConfig
 
 # -----------------------------------------------------------------------------
@@ -251,9 +251,12 @@ def create_plot(token_counts, trans_speeds, laminar_speeds, save_path):
 # Ana Benchmark
 # -----------------------------------------------------------------------------
 def run_benchmark():
-    from google.colab import drive
-    if not os.path.exists("/content/drive/MyDrive"):
-        drive.mount('/content/drive')
+    try:
+        from google.colab import drive
+        if not os.path.exists("/content/drive/MyDrive"):
+            drive.mount('/content/drive')
+    except ImportError:
+        pass # Not in colab
 
     os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -267,7 +270,11 @@ def run_benchmark():
     t_conf = TransformerConfig()
     transformer = TransformerBaseline(t_conf).to(DEVICE)
     trans_path = os.path.join(BASE_DIR, "transformer_latest.pt")
-    transformer.load_state_dict(torch.load(trans_path, map_location=DEVICE, weights_only=True))
+    if os.path.exists(trans_path):
+        transformer.load_state_dict(torch.load(trans_path, map_location=DEVICE, weights_only=True))
+        print("   -> Transformer weights loaded.")
+    else:
+        print("   -> Transformer weights not found, using random initialization for speed test.")
     transformer.eval()
     t_params = sum(p.numel() for p in transformer.parameters()) / 1e6
     print(f"   ✅ Transformer ({t_params:.1f}M parametre)")
@@ -279,7 +286,11 @@ def run_benchmark():
     )
     laminarnet = LaminarNet(l_conf).to(DEVICE)
     lam_path = os.path.join(BASE_DIR, "laminarnet_latest.pt")
-    laminarnet.load_state_dict(torch.load(lam_path, map_location=DEVICE, weights_only=True))
+    if os.path.exists(lam_path):
+        laminarnet.load_state_dict(torch.load(lam_path, map_location=DEVICE, weights_only=True))
+        print("   -> LaminarNet weights loaded.")
+    else:
+        print("   -> LaminarNet weights not found, using random initialization for speed test.")
     laminarnet.eval()
     l_params = sum(p.numel() for p in laminarnet.parameters()) / 1e6
     print(f"   ✅ LaminarNet  ({l_params:.1f}M parametre)")
