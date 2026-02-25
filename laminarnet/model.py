@@ -391,29 +391,35 @@ class LaminarNet(nn.Module):
         self.apply(lambda m: nn.init.normal_(m.weight, std=0.02) if isinstance(m, (nn.Linear, nn.Embedding)) else None)
 
     def forward(self, ids):
-        B, N = ids.shape
-        x = self.dropout(self.tok_emb(ids))
-        # CAUSAL strata init: left-pad so each coarse position only sees past/current
-        coarse_strata = []
-        for pool in self.strata_init:
-            x_t = x.transpose(1, 2)
-            k = pool.kernel_size[0] if isinstance(pool.kernel_size, tuple) else pool.kernel_size
-            x_t = F.pad(x_t, (k - 1, 0))
-            coarse_strata.append(pool(x_t).transpose(1, 2))
-        strata = [x] + coarse_strata
-        
-        # DenseNet-style cross-block residual accumulator for fine stratum
-        # The scale down (0.5) helps prevent activation explosion in deep networks
-        fine_accumulator = 0
-        for b in self.blocks:
-            strata[0] = strata[0] + fine_accumulator * 0.5
-            strata = b(strata)
-            if isinstance(fine_accumulator, int):
-                fine_accumulator = strata[0]
-            else:
-                fine_accumulator = (fine_accumulator + strata[0]).clamp(min=-6e4, max=6e4)
+        # Disable AMP autocast for the ENTIRE forward pass.
+        # LaminarNet's SSM scan, CSR routing, and head projection are all
+        # numerically unsafe under float16. The sub-modules also disable
+        # autocast internally, but the head (nn.Linear 320->50257) matmul
+        # was still being forced to fp16 by the caller's autocast context.
+        device_type = ids.device.type if ids.device.type != 'cpu' else 'cpu'
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            B, N = ids.shape
+            x = self.dropout(self.tok_emb(ids)).float()
+            # CAUSAL strata init: left-pad so each coarse position only sees past/current
+            coarse_strata = []
+            for pool in self.strata_init:
+                x_t = x.transpose(1, 2)
+                k = pool.kernel_size[0] if isinstance(pool.kernel_size, tuple) else pool.kernel_size
+                x_t = F.pad(x_t, (k - 1, 0))
+                coarse_strata.append(pool(x_t).transpose(1, 2))
+            strata = [x] + coarse_strata
             
-        return self.head(self.norm_out(strata[0]))
+            # DenseNet-style cross-block residual accumulator for fine stratum
+            fine_accumulator = 0
+            for b in self.blocks:
+                strata[0] = strata[0] + fine_accumulator * 0.5
+                strata = b(strata)
+                if isinstance(fine_accumulator, int):
+                    fine_accumulator = strata[0]
+                else:
+                    fine_accumulator = fine_accumulator + strata[0]
+                
+            return self.head(self.norm_out(strata[0]))
 
     def count_parameters(self): return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
