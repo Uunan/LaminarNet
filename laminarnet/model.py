@@ -56,7 +56,9 @@ class RMSNorm(nn.Module):
         orig_dtype = x.dtype
         x_f32 = x.float()
         rms = x_f32.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (self.scale * (x_f32 * rms)).to(orig_dtype)
+        # Ensure scale is float before multiplying, then clamp and downcast safely
+        out = self.scale.float() * (x_f32 * rms)
+        return out.clamp(min=-6e4, max=6e4).to(orig_dtype)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -139,9 +141,9 @@ class GeometricDriftField(nn.Module):
         fused = self.in_proj(x_conv)
         dt_raw, v, gate = fused.chunk(3, dim=-1)
 
-        # 2. Selective Parameters
-        dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=0.001, max=2.0).to(dt_raw.dtype)
-        gate = torch.sigmoid(gate)
+        # 2. Selective Parameters (Cast and keep in FP32)
+        dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=0.001, max=2.0)
+        gate = torch.sigmoid(gate.float())
         
         # Integrate gate into log_alpha logic for true parallel scan equivalency
         # If gate is 0, we want to forget everything -> decay should be infinite (log_alpha = -inf)
@@ -210,7 +212,8 @@ class GeometricDriftField(nn.Module):
         else:
             final_out = chunk_out
 
-        # Finally cast back to native precision
+        # Finally cast back to native precision, strictly clamping to avoid FP16 Infinity!
+        final_out = final_out.clamp(min=-6e4, max=6e4)
         final_out = final_out.to(x.dtype).view(B, -1, D)[:, :orig_N, :]
 
         # Talking Heads Mixing
@@ -406,7 +409,10 @@ class LaminarNet(nn.Module):
         for b in self.blocks:
             strata[0] = strata[0] + fine_accumulator * 0.5
             strata = b(strata)
-            fine_accumulator = fine_accumulator + strata[0]
+            if isinstance(fine_accumulator, int):
+                fine_accumulator = strata[0]
+            else:
+                fine_accumulator = (fine_accumulator + strata[0]).clamp(min=-6e4, max=6e4)
             
         return self.head(self.norm_out(strata[0]))
 
