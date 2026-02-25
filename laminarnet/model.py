@@ -209,10 +209,6 @@ class GeometricDriftField(nn.Module):
 
         final_out = final_out.view(B, -1, D)[:, :orig_N, :]
 
-        final_out = final_out[:, :orig_N, :]
-
-        final_out = final_out[:, :orig_N, :]
-
         # Talking Heads Mixing
         v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
         # Apply head_mix (n_heads, n_heads) over axis 2
@@ -581,4 +577,4 @@ if __name__ == "__main__":
     conf = LaminarNetConfig()
     model = LaminarNet(conf)
     x = torch.randint(0, conf.vocab_size, (2, 128))
-    print(f"LaminarNet v0.6.0 | Out: {model(x).shape}")
+    print(f"LaminarNet v0.6.5 | Out: {model(x).shape}")
