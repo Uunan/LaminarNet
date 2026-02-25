@@ -311,12 +311,14 @@ class CrossStratumRouting(nn.Module):
         Lc = h_coarse.shape[1]
         if f_to_c.shape[1] < Lc:
             f_to_c = F.pad(f_to_c, (0, 0, 0, Lc - f_to_c.shape[1]))
-        h_coarse = h_coarse + self.gate_f2c(f_to_c[:, :Lc, :]) * f_to_c[:, :Lc, :]
+        g_f2c = self.gate_f2c(f_to_c[:, :Lc, :])
+        h_coarse = (1.0 - g_f2c) * h_coarse + g_f2c * f_to_c[:, :Lc, :]
         c_to_f = self.up(h_coarse.transpose(1, 2)).transpose(1, 2)
         Lf = h_fine.shape[1]
         if c_to_f.shape[1] < Lf:
             c_to_f = F.pad(c_to_f, (0, 0, 0, Lf - c_to_f.shape[1]))
-        h_fine = h_fine + self.gate_c2f(c_to_f[:, :Lf, :]) * c_to_f[:, :Lf, :]
+        g_c2f = self.gate_c2f(c_to_f[:, :Lf, :])
+        h_fine = (1.0 - g_c2f) * h_fine + g_c2f * c_to_f[:, :Lf, :]
         return h_fine, h_coarse
 
     def step(self, h_f_step: torch.Tensor, h_c_step: torch.Tensor, state: dict):
@@ -336,14 +338,16 @@ class CrossStratumRouting(nn.Module):
             f_to_c = window.mean(dim=1, keepdim=True)
             
             g_f2c = self.gate_f2c(f_to_c)
-            last_c = h_c_step + g_f2c * f_to_c
+            # Stable interpolation for step routing
+            last_c = (1.0 - g_f2c) * h_c_step + g_f2c * f_to_c
             new_h_c_step = last_c
         else:
             new_h_c_step = last_c # return the appropriately updated coarse token from the last tick
             
+        # 2. Coarse-to-Fine (Up Routing) - Dense replication via nearest approach
         c_to_f = last_c
         g_c2f = self.gate_c2f(c_to_f)
-        new_h_f_step = h_f_step + g_c2f * c_to_f
+        new_h_f_step = (1.0 - g_c2f) * h_f_step + g_c2f * c_to_f
         
         # Rotate buffer
         if self.stride > 1:
