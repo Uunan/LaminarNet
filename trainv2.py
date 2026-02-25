@@ -31,7 +31,7 @@ try:
     from laminarnet import LaminarNet, LaminarNetConfig
 except ImportError:
     print("LaminarNet package not found. Installing...")
-    os.system("pip install laminarnet==0.7.0")
+    os.system("pip install laminarnet==0.7.1")
     from laminarnet import LaminarNet, LaminarNetConfig
 
 # -----------------------------------------------------------------------------
@@ -188,11 +188,11 @@ def format_tokens(n):
 # -----------------------------------------------------------------------------
 # Değerlendirme & Metrikler
 # -----------------------------------------------------------------------------
-def evaluate(model, dataloader, device, max_batches=50, use_amp=True):
+def evaluate(model, dataloader, device, max_batches=50):
     model.eval()
     total_loss, total_tokens = 0, 0
     criterion = nn.CrossEntropyLoss(reduction='sum')
-    with torch.no_grad(), torch.amp.autocast('cuda', enabled=use_amp):
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=USE_AMP):
         for i, (x, y) in enumerate(dataloader):
             if i >= max_batches:
                 break
@@ -407,16 +407,15 @@ def train_colab():
             t0 = time.time()
 
             opt_l.zero_grad(set_to_none=True)
-            # NOTE: LaminarNet trains WITHOUT AMP (no autocast, no GradScaler).
-            # SSM architectures (Mamba, RWKV, LaminarNet) use cumulative exponential
-            # scan math that is fundamentally incompatible with float16.
-            # LaminarNet is already ~40% faster than Transformer, so AMP is unnecessary.
-            logits_l = laminarnet(x)
-            loss_l   = criterion(logits_l.view(-1, VOCAB_SIZE), y.view(-1))
+            with torch.amp.autocast('cuda', enabled=USE_AMP):
+                logits_l = laminarnet(x)
+                loss_l   = criterion(logits_l.view(-1, VOCAB_SIZE), y.view(-1))
 
-            loss_l.backward()
+            scaler_l.scale(loss_l).backward()
+            scaler_l.unscale_(opt_l)
             torch.nn.utils.clip_grad_norm_(laminarnet.parameters(), 1.0)
-            opt_l.step()
+            scaler_l.step(opt_l)
+            scaler_l.update()
 
             if DEVICE.type == "cuda":
                 torch.cuda.synchronize()
@@ -439,7 +438,7 @@ def train_colab():
             if global_step % VAL_INTERVAL == 0:
                 print("\n  🔍 Validation Checkpoint...")
                 val_loss_t, ppl_t = evaluate(transformer, val_loader, DEVICE)
-                val_loss_l, ppl_l = evaluate(laminarnet,  val_loader, DEVICE, use_amp=False)
+                val_loss_l, ppl_l = evaluate(laminarnet,  val_loader, DEVICE)
 
                 # Transformer Kaydı (Ayrı Timer ile)
                 save_csv(log_file, {
@@ -469,7 +468,7 @@ def train_colab():
     # Eğitim tam bitince Final Validation
     print("\n🏁 Eğitim Tamamlandı. Final Validation yapılıyor...")
     val_loss_t, ppl_t = evaluate(transformer, val_loader, DEVICE, max_batches=200)
-    val_loss_l, ppl_l = evaluate(laminarnet,  val_loader, DEVICE, max_batches=200, use_amp=False)
+    val_loss_l, ppl_l = evaluate(laminarnet,  val_loader, DEVICE, max_batches=200)
 
     print(f"\n🏆 FİNAL SONUÇLAR:")
     print(f"   Transformer → Val Loss: {val_loss_t:.4f} | PPL: {ppl_t:.2f}")
