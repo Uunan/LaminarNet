@@ -173,9 +173,9 @@ class GeometricDriftField(nn.Module):
         la_chunks = log_alpha.view(B, num_chunks, chunk_size, D)
 
         # Cumulative log-decay within each chunk — CLAMP to prevent exp overflow
-        # exp(-20) ≈ 2e-9 (negligible memory), exp(20) ≈ 5e8 (safe in float32)
-        L_chunks = torch.cumsum(la_chunks, dim=2)
-        L_chunks = L_chunks.float().clamp(min=-20.0, max=0.0)
+        # Ensure cumsum happens in float32, not float16!
+        L_chunks = torch.cumsum(la_chunks.float(), dim=2)
+        L_chunks = L_chunks.clamp(min=-20.0, max=0.0)
 
         # O(N) intra-chunk scan via cumsum (float32)
         L_max = L_chunks.max(dim=2, keepdim=True).values
@@ -369,7 +369,9 @@ class SwiGLUFFN(nn.Module):
     def forward(self, x):
         res = x
         x = self.norm(x)
-        return res + self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        # Protect SwiGLU multiplication from exceeding float16 limit
+        gate_val = (F.silu(self.w1(x)) * self.w3(x)).clamp(min=-6e4, max=6e4)
+        return res + self.dropout(self.w2(gate_val))
 
 class LaminarNet(nn.Module):
     def __init__(self, config: LaminarNetConfig):
@@ -397,16 +399,17 @@ class LaminarNet(nn.Module):
         strata = [x] + coarse_strata
         
         # DenseNet-style cross-block residual accumulator for fine stratum
-        fine_accumulator = 0
+        # Must strictly remain in float32 and be clamped to prevent fp16 overflow across blocks.
+        fine_accumulator = 0.0
         for b in self.blocks:
             strata[0] = strata[0] + fine_accumulator * 0.5
             strata = b(strata)
-            if isinstance(fine_accumulator, int):
-                fine_accumulator = strata[0]
-            else:
-                fine_accumulator = fine_accumulator + strata[0]
+            fine_accumulator = (fine_accumulator + strata[0].float()).clamp(min=-6e4, max=6e4)
             
-        return self.head(self.norm_out(strata[0]))
+        # The final head projection is a 320 -> 50257 matmul. In float16, this almost
+        # always overflows the 65504 limit if not protected.
+        with torch.amp.autocast(device_type=ids.device.type if ids.device.type != 'cpu' else 'cpu', enabled=False):
+            return self.head(self.norm_out(strata[0].float()))
 
     def count_parameters(self): return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
