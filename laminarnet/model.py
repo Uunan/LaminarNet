@@ -1,6 +1,6 @@
 """
-LaminarNet v0.7.7 — Speed & Math Equality Update
-                    Chunked Parallel Scan, DenseNet Accumulator Fix, Talking Heads
+LaminarNet v0.7.8 — Final Optimizations
+                    Vectorized Chunked Scan, Stride Precompute, Autocast Fix
 All temporal operations are strictly causal — no future information leakage.
 Recurrent inference: token-by-token generation via step() using the same trained weights.
 forward() and step() now produce mathematically identical results with high performance.
@@ -184,16 +184,28 @@ class GeometricDriftField(nn.Module):
         exp_L_stable = torch.exp(L_stable)                       # ∈ (0, 1]
         chunk_out = exp_L_stable * cum_scaled                    # (B, C, T, D)
 
-        # Inter-chunk carry propagation — O(num_chunks) loop
-        carry = torch.zeros(B, 1, D, dtype=torch.float32, device=x.device)
-        all_outs = []
-        for c in range(num_chunks):
-            # Carry decays through this chunk: exp(L_t) ∈ (0, 1], safe in float32
-            carry_contribution = carry * torch.exp(L_chunks[:, c, :, :])
-            total = chunk_out[:, c, :, :] + carry_contribution
-            all_outs.append(total)
-            carry = total[:, -1:, :]                             # state at end of this chunk
-        final_out = torch.cat(all_outs, dim=1)[:, :orig_N, :].to(x.dtype)
+        # Inter-chunk carry propagation — O(1) Fully Vectorized
+        seed       = chunk_out[:, :, -1, :]                             # (B, C, D)
+        log_d      = L_chunks[:, :, -1, :]                              # (B, C, D)
+        log_D_full = torch.cumsum(log_d, dim=1)                         # (B, C, D)
+        log_D      = F.pad(log_D_full[:, :-1, :], (0, 0, 1, 0))         # shift, log_D[0]=0
+
+        exponent   = log_D.unsqueeze(2) - log_D_full.unsqueeze(1)       # (B, C, C, D) ≤ 0
+        causal     = torch.tril(torch.ones(num_chunks, num_chunks,
+                         device=x.device, dtype=torch.bool), diagonal=-1)
+        exp_masked = exponent.masked_fill(
+                         ~causal.unsqueeze(0).unsqueeze(-1), float('-inf'))
+
+        # NaN fix: c=0 row is entirely -inf -> stab=-inf -> -inf-(-inf)=NaN
+        # Convert -inf to 0.0 using torch.where
+        stab = exp_masked.max(dim=2, keepdim=True).values
+        stab = torch.where(torch.isinf(stab), torch.zeros_like(stab), stab)
+
+        weights  = torch.exp(exp_masked - stab)                         # masked->0, valid->(0,1]
+        carries  = (seed.unsqueeze(1) * weights).sum(dim=2) * torch.exp(stab.squeeze(2))
+
+        final_out = (chunk_out + carries.unsqueeze(2) * torch.exp(L_chunks))
+        final_out = final_out.reshape(B, N_padded, D)[:, :orig_N].to(x.dtype)
 
         # Talking Heads Mixing
         v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
@@ -250,7 +262,6 @@ class GeometricDriftField(nn.Module):
         # So we gate the old carry, but add the new v_rotated normally.
         carry = state["carry"].float()                                 # (B, D)
         dt_sq = dt.squeeze(1).float()                                  # (B, D)
-        gate_sq = gate.squeeze(1)                                      # (B, D)
         v_rotated = v_rotated.float()
         
         # Strict v0.6.3 recurrence: no forget gate on carry, only output gate
@@ -372,6 +383,10 @@ class LaminarNet(nn.Module):
         self.norm_out = RMSNorm(d)
         self.head = nn.Linear(d, config.vocab_size, bias=False)
         self.head.weight = self.tok_emb.weight
+        
+        # head_mix: eye init (intentional — identity mixing at start)
+        # dt_bias: inverse-softplus init (intentional — head-specific decay)
+        # RMSNorm.scale: ones init (intentional)
         self.apply(lambda m: nn.init.normal_(m.weight, std=0.02) if isinstance(m, (nn.Linear, nn.Embedding)) else None)
 
     def forward(self, ids):
@@ -395,7 +410,7 @@ class LaminarNet(nn.Module):
             
         # The final head projection is a 320 -> 50257 matmul. In float16, this almost
         # always overflows the 65504 limit if not protected.
-        with torch.amp.autocast(device_type=ids.device.type if ids.device.type != 'cpu' else 'cpu', enabled=False):
+        with torch.amp.autocast(device_type=ids.device.type, enabled=False):
             return self.head(self.norm_out(strata[0].float()))
 
     def count_parameters(self): return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -483,6 +498,7 @@ class LaminarNet(nn.Module):
             last_c = s_state["last_c"][s]
             
             if pos % k == 0:
+                # pos=0 special case: buffer is full of zeros. This aligns exactly with forward()'s F.pad(x_t, (k-1, 0))
                 # Need 1 less element than kernel size from the buffer
                 window = torch.cat([buf_f[:, -(k-1):, :] if k > 1 else torch.empty(x.shape[0], 0, x.shape[2], device=x.device), x], dim=1)
                 new_c = window.mean(dim=1, keepdim=True)
@@ -522,6 +538,12 @@ class LaminarBlock(nn.Module):
         self.gdfs = nn.ModuleList([GeometricDriftField(config.d_model, config.n_heads, config.dropout, config.conv_kernel, config.rope_base) for _ in range(self.S)])
         self.csrs = nn.ModuleList([CrossStratumRouting(config.d_model, config.strata_ratios[s+1]//config.strata_ratios[s]) for s in range(self.S-1)])
         self.ffns = nn.ModuleList([SwiGLUFFN(config.d_model, config.d_ff, config.dropout) for _ in range(self.S)])
+        
+        # Precompute strides for step() to avoid O(S^2) recalculation per token
+        self.strides = [1]
+        for s in range(1, self.S):
+            self.strides.append(self.strides[-1] * self.csrs[s-1].stride)
+            
     def forward(self, strata):
         for s in range(self.S): strata[s] = self.gdfs[s](strata[s])
         
@@ -537,17 +559,8 @@ class LaminarBlock(nn.Module):
         """Single-token step through block. Returns (strata, new_block_state)."""
         new_gdf_state = []
         
-        # Calculate cumulative strides for each stratum
-        # strata 0 has stride 1
-        # strata s has stride Product(strata_ratios[:s])
-        
         for s in range(self.S):
-            if s == 0:
-                stride = 1
-            else:
-                stride = 1
-                for r in range(s):
-                    stride *= self.csrs[r].stride
+            stride = self.strides[s]
                     
             if pos % stride == 0:
                 strata[s], new_s = self.gdfs[s].step(strata[s], block_state["gdfs"][s])
@@ -574,4 +587,4 @@ if __name__ == "__main__":
     conf = LaminarNetConfig()
     model = LaminarNet(conf)
     x = torch.randint(0, conf.vocab_size, (2, 128))
-    print(f"LaminarNet v0.6.5 | Out: {model(x).shape}")
+    print(f"LaminarNet v0.7.8 | Out: {model(x).shape}")

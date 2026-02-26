@@ -46,7 +46,7 @@ LR_LAM        = 6e-4       # LaminarNet (O(N) mimariler x2 veya x3 kat fazla LR 
 VAL_INTERVAL  = 200
 LOG_INTERVAL  = 10
 SAVE_INTERVAL = 500
-BASE_LOG_DIR  = "/content/drive/MyDrive/LaminarNet_Bench"
+BASE_LOG_DIR  = "/content/drive/MyDrive/LaminarNet_BenchV5"
 DATASET_PATH  = "/content/drive/MyDrive/FineWeb_Data/fineweb_10gb.jsonl"
 PACKED_PATH   = "/content/drive/MyDrive/FineWeb_Data/packed_tokens_1b.pt"
 
@@ -336,7 +336,7 @@ def train_colab():
     t_conf = TransformerConfig(vocab_size=VOCAB_SIZE, d_model=416, n_layers=10, d_ff=416*4)
     l_conf = LaminarNetConfig(
         vocab_size=VOCAB_SIZE, d_model=320, n_heads=5, n_layers=10,
-        d_ff=1200, n_strata=2, strata_ratios=(1, 2, 4), seq_len=SEQ_LEN, dropout=0.1
+        d_ff=1200, n_strata=2, strata_ratios=(1, 2), seq_len=SEQ_LEN, dropout=0.1
     )
 
     transformer = TransformerBaseline(t_conf).to(DEVICE)

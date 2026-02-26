@@ -21,7 +21,7 @@ torch.set_float32_matmul_precision('high')
 try:
     from laminarnet import LaminarNet, LaminarNetConfig
 except ImportError:
-    os.system("pip install laminarnet==0.6.5")
+    os.system("pip install laminarnet==0.7.8")
     from laminarnet import LaminarNet, LaminarNetConfig
 
 # -----------------------------------------------------------------------------
@@ -282,7 +282,7 @@ def run_benchmark():
     print("\n🔴 LaminarNet yükleniyor...")
     l_conf = LaminarNetConfig(
         vocab_size=VOCAB_SIZE, d_model=320, n_heads=5, n_layers=10,
-        d_ff=1200, n_strata=2, strata_ratios=(1, 2, 4), seq_len=SEQ_LEN, dropout=0.1
+        d_ff=1200, n_strata=2, strata_ratios=(1, 2), seq_len=SEQ_LEN, dropout=0.1
     )
     laminarnet = LaminarNet(l_conf).to(DEVICE)
     lam_path = os.path.join(BASE_DIR, "laminarnet_latest.pt")
