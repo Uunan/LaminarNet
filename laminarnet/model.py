@@ -1,9 +1,9 @@
 """
-LaminarNet v0.7.6 — Forward/Step Mathematical Consistency Fix
-                    Sequential Scan, DenseNet Accumulator Fix, Talking Heads
+LaminarNet v0.7.7 — Speed & Math Equality Update
+                    Chunked Parallel Scan, DenseNet Accumulator Fix, Talking Heads
 All temporal operations are strictly causal — no future information leakage.
 Recurrent inference: token-by-token generation via step() using the same trained weights.
-forward() and step() now produce mathematically identical results (max diff < 1e-6).
+forward() and step() now produce mathematically identical results with high performance.
 """
 
 import math
@@ -153,21 +153,47 @@ class GeometricDriftField(nn.Module):
         v_view = v.view(B, N, self.n_heads, self.d_head)
         v_rotated = apply_rope(v_view, cos_f, sin_f).reshape(B, N, D)
 
-        # 4. O(N) Sequential Scan — exact mathematical match with step() recurrence
+        # 4. O(N) Chunked Parallel Scan — vectorized within chunks, exact match with step()
         #    h_t = exp(-dt_t) * h_{t-1} + dt_t * v_t
+        #    chunk_size=32 keeps max |L range| = 64, safely within float32 (exp(64) ≈ 6e27)
+        chunk_size = 32
         v_in = v_rotated.float() * dt.float()           # (B, N, D) float32
-        alpha = torch.exp(log_alpha)                     # (B, N, D) float32, = exp(-dt)
 
         orig_N = N
-        # Sequential scan over full sequence
-        carry = torch.zeros(B, D, dtype=torch.float32, device=x.device)
-        scan_outs = []
-        for t in range(N):
-            carry = alpha[:, t, :] * carry + v_in[:, t, :]
-            scan_outs.append(carry)
-        final_out = torch.stack(scan_outs, dim=1).to(x.dtype)  # (B, N, D)
+        remainder = N % chunk_size
+        if remainder != 0:
+            pad_len = chunk_size - remainder
+            v_in = F.pad(v_in, (0, 0, 0, pad_len))
+            log_alpha = F.pad(log_alpha, (0, 0, 0, pad_len))
 
-        final_out = final_out[:, :orig_N, :]
+        N_padded = v_in.shape[1]
+        num_chunks = N_padded // chunk_size
+
+        v_chunks = v_in.view(B, num_chunks, chunk_size, D)
+        la_chunks = log_alpha.view(B, num_chunks, chunk_size, D)
+
+        # Cumulative log-decay within each chunk — NO CLAMP (float32-safe at chunk_size=32)
+        L_chunks = torch.cumsum(la_chunks, dim=2)               # (B, C, T, D)
+
+        # Stabilized intra-chunk parallel scan via cumsum
+        L_max = L_chunks[:, :, 0:1, :]                           # max is always at pos 0 (L is decreasing)
+        L_stable = L_chunks - L_max
+        exp_neg_L_stable = torch.exp(-L_stable)                  # ≥ 1, bounded by exp(chunk_size * 2)
+        scaled_v = exp_neg_L_stable * v_chunks.float()
+        cum_scaled = torch.cumsum(scaled_v, dim=2)
+        exp_L_stable = torch.exp(L_stable)                       # ∈ (0, 1]
+        chunk_out = exp_L_stable * cum_scaled                    # (B, C, T, D)
+
+        # Inter-chunk carry propagation — O(num_chunks) loop
+        carry = torch.zeros(B, 1, D, dtype=torch.float32, device=x.device)
+        all_outs = []
+        for c in range(num_chunks):
+            # Carry decays through this chunk: exp(L_t) ∈ (0, 1], safe in float32
+            carry_contribution = carry * torch.exp(L_chunks[:, c, :, :])
+            total = chunk_out[:, c, :, :] + carry_contribution
+            all_outs.append(total)
+            carry = total[:, -1:, :]                             # state at end of this chunk
+        final_out = torch.cat(all_outs, dim=1)[:, :orig_N, :].to(x.dtype)
 
         # Talking Heads Mixing
         v_mix = final_out.view(B, orig_N, self.n_heads, self.d_head)
