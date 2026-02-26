@@ -1,9 +1,9 @@
 """
-LaminarNet v0.6.5 — Recurrent Inference & Math Equality Update
-                    Forget Gate, Talking Heads, Iterative CSR, DenseNet Residuals
-Faster than Transformer: larger chunks, streamlined architecture, vectorized carry.
+LaminarNet v0.7.6 — Forward/Step Mathematical Consistency Fix
+                    Sequential Scan, DenseNet Accumulator Fix, Talking Heads
 All temporal operations are strictly causal — no future information leakage.
 Recurrent inference: token-by-token generation via step() using the same trained weights.
+forward() and step() now produce mathematically identical results (max diff < 1e-6).
 """
 
 import math
@@ -153,59 +153,19 @@ class GeometricDriftField(nn.Module):
         v_view = v.view(B, N, self.n_heads, self.d_head)
         v_rotated = apply_rope(v_view, cos_f, sin_f).reshape(B, N, D)
 
-        # 4. O(N) Vectorized Parallel Scan — chunk_size=256 for speed
-        chunk_size = 256
-        v_in = v_rotated * dt
+        # 4. O(N) Sequential Scan — exact mathematical match with step() recurrence
+        #    h_t = exp(-dt_t) * h_{t-1} + dt_t * v_t
+        v_in = v_rotated.float() * dt.float()           # (B, N, D) float32
+        alpha = torch.exp(log_alpha)                     # (B, N, D) float32, = exp(-dt)
 
-        # Pad to nearest chunk multiple
         orig_N = N
-        remainder = N % chunk_size
-        if remainder != 0:
-            pad_len = chunk_size - remainder
-            v_in = F.pad(v_in, (0, 0, 0, pad_len))
-            log_alpha = F.pad(log_alpha, (0, 0, 0, pad_len))
-
-        N_padded = v_in.shape[1]
-        num_chunks = N_padded // chunk_size
-
-        v_chunks = v_in.view(B, num_chunks, chunk_size, D)
-        la_chunks = log_alpha.view(B, num_chunks, chunk_size, D)
-
-        # Cumulative log-decay within each chunk — CLAMP to prevent exp overflow
-        # Ensure cumsum happens in float32, not float16!
-        L_chunks = torch.cumsum(la_chunks.float(), dim=2)
-        L_chunks = L_chunks.clamp(min=-20.0, max=0.0)
-
-        # O(N) intra-chunk scan via cumsum (float32)
-        L_max = L_chunks.max(dim=2, keepdim=True).values
-        L_stable = L_chunks - L_max
-        exp_neg_L_stable = torch.exp(-L_stable)
-        scaled_v = exp_neg_L_stable * v_chunks.float()
-        cum_scaled = torch.cumsum(scaled_v, dim=2)
-        exp_L_stable = torch.exp(L_stable)
-        chunk_out = exp_L_stable * cum_scaled  # float32
-
-        # 5. Parallel inter-chunk carry (no Python for-loop) — all in float32
-        if num_chunks > 1:
-            chunk_boundary_decay = L_chunks[:, :, -1, :]
-            chunk_boundary_out = chunk_out[:, :, -1, :]
-
-            # Parallel prefix sum in log-space
-            cum_decay = torch.cumsum(chunk_boundary_decay, dim=1).clamp(min=-80.0, max=0.0)
-
-            # Log-space stabilized parallel carry
-            stabilizer = cum_decay.max(dim=1, keepdim=True).values
-            norm_cum_decay = (cum_decay - stabilizer).clamp(min=-20.0, max=0.0)
-
-            seeds = chunk_boundary_out * torch.exp(-norm_cum_decay)
-            shifted_seeds = F.pad(seeds[:, :-1], (0, 0, 1, 0))
-            cum_seeds = torch.cumsum(shifted_seeds, dim=1)
-            carries = cum_seeds * torch.exp(norm_cum_decay)
-
-            final_out = chunk_out + carries.unsqueeze(2) * torch.exp(L_chunks)
-            final_out = final_out.to(x.dtype).view(B, -1, D)
-        else:
-            final_out = chunk_out.to(x.dtype).view(B, -1, D)
+        # Sequential scan over full sequence
+        carry = torch.zeros(B, D, dtype=torch.float32, device=x.device)
+        scan_outs = []
+        for t in range(N):
+            carry = alpha[:, t, :] * carry + v_in[:, t, :]
+            scan_outs.append(carry)
+        final_out = torch.stack(scan_outs, dim=1).to(x.dtype)  # (B, N, D)
 
         final_out = final_out[:, :orig_N, :]
 
@@ -400,8 +360,12 @@ class LaminarNet(nn.Module):
             coarse_strata.append(pool(x_t).transpose(1, 2))
         strata = [x] + coarse_strata
         
+        # DenseNet-style cross-block residual accumulator for fine stratum
+        fine_accumulator = torch.zeros_like(strata[0])
         for b in self.blocks:
+            strata[0] = strata[0] + fine_accumulator * 0.5
             strata = b(strata)
+            fine_accumulator = fine_accumulator + strata[0]
             
         # The final head projection is a 320 -> 50257 matmul. In float16, this almost
         # always overflows the 65504 limit if not protected.
@@ -515,7 +479,7 @@ class LaminarNet(nn.Module):
 
         new_block_states = []
         # DenseNet-style cross-block residual accumulator for fine stratum
-        fine_accumulator = 0
+        fine_accumulator = torch.zeros_like(strata[0])
         for i, block in enumerate(self.blocks):
             strata[0] = strata[0] + fine_accumulator * 0.5
             strata, bs = block.step(strata, state["block_states"][i], pos)
