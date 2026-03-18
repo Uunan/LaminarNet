@@ -26,7 +26,8 @@ The entire architecture supports two execution modes on the **same trained weigh
 ---
 
 ## Architecture
-
+## 📄 Paper
+https://zenodo.org/records/19098762
 ### High-Level Structure
 
 ```
@@ -276,6 +277,8 @@ print(f"Trainable: {info['trainable']/1e6:.1f}M")
 MIT — see [LICENSE](LICENSE).
 
 ---
+
+
 
 <div align="center">
 Developed by <a href="https://github.com/Uunan">Unan</a>
